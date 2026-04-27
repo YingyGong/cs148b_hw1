@@ -7,7 +7,10 @@ import numpy.typing as npt
 import torch
 from jaxtyping import Bool, Float, Int
 from torch import Tensor
+import regex as re
+from collections import Counter
 
+from eecs148b_hw1 import Linear, Embedding, LayerNorm, FFN, SinusoidalPositionalEncoding, Softmax, MultiHeadSelfAttention
 
 def run_linear(
     d_in: int,
@@ -27,7 +30,11 @@ def run_linear(
     Returns:
         Float[Tensor, "... d_out"]: The transformed output of your linear module.
     """
-    raise NotImplementedError
+    model = Linear(in_features=d_in, out_features=d_out)
+    model.load_state_dict({"W": weights})
+    model.eval()
+    with torch.no_grad():
+        return model(in_features)
 
 
 def run_embedding(
@@ -48,7 +55,11 @@ def run_embedding(
     Returns:
         Float[Tensor, "... d_model"]: Batch of embeddings returned by your Embedding layer.
     """
-    raise NotImplementedError
+    model = Embedding(vocab_size, d_model)
+    model.load_state_dict({"E":weights})
+    model.eval()
+    with torch.no_grad():
+        return model(token_ids)
 
 
 def run_ffn(
@@ -77,7 +88,12 @@ def run_ffn(
     # You can also manually assign the weights
     # ffn.fc1.weight.data = w1_weight
     # ffn.fc2.weight.data = w2_weight
-    raise NotImplementedError
+    model = FFN(d_model, d_ff)
+    model.load_state_dict({"w1.W": w1_weight, "w2.W": w2_weight})
+    model.eval()
+    with torch.no_grad():
+        return model(in_features)
+
 
 
 def run_layernorm(
@@ -100,7 +116,11 @@ def run_layernorm(
     Returns:
         Float[Tensor, "... d_model"]: Tensor with the output of running LayerNorm on `in_features`.
     """
-    raise NotImplementedError
+    model = LayerNorm(d_model=d_model, eps=eps)
+    model.load_state_dict({'g': weight, 'b': bias})
+    model.eval()
+    with torch.no_grad():
+        return model(in_features)
 
 
 def run_sinusoidal_pe(
@@ -109,8 +129,9 @@ def run_sinusoidal_pe(
     token_positions: Int[Tensor, " ... sequence_length"],
 ) -> Float[Tensor, " ... sequence_length d_model"]:
     """Return sinusoidal positional embeddings for the given token positions."""
-    raise NotImplementedError
-
+    model = SinusoidalPositionalEncoding(d_model=d_model, max_seq_len=max_seq_len)
+    return model(token_positions)
+    
 
 def run_scaled_dot_product_attention(
     Q: Float[Tensor, " ... queries d_k"],
@@ -130,8 +151,13 @@ def run_scaled_dot_product_attention(
     Returns:
         Float[Tensor, " ... queries d_v"]: Output of SDPA
     """
-    raise NotImplementedError
-
+    scores = Q @ K.transpose(-1, -2)
+    scale = torch.sqrt(torch.tensor(Q.shape[-1]))
+    normalized_scores = scores / scale
+    if mask is not None:
+        normalized_scores = normalized_scores.masked_fill(~mask, float("-inf"))
+    attn_weights = run_softmax(normalized_scores, dim=-1)
+    return attn_weights @ V
 
 def run_multihead_self_attention(
     d_model: int,
@@ -164,7 +190,24 @@ def run_multihead_self_attention(
         Float[Tensor, " ... sequence_length d_out"]: Tensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
     """
-    raise NotImplementedError
+    # print(q_proj_weight.shape)
+    # print("Debug---------------")
+    # print(num_heads, d_model)
+    # w_q = q_proj_weight.repeat(num_heads, 1)
+    # w_k = k_proj_weight.repeat(num_heads, 1)
+    # w_v = v_proj_weight.repeat(num_heads, 1)
+    # w_o = o_proj_weight.repeat(1, num_heads)
+    
+    w_q = q_proj_weight
+    w_k = k_proj_weight
+    w_v = v_proj_weight
+    w_o = o_proj_weight    
+    
+    model = MultiHeadSelfAttention(d_model=d_model, num_heads=num_heads)
+    model.load_state_dict({"w_q.W": w_q, "w_k.W": w_k, "w_v.W": w_v, "w_o.W": w_o})
+    model.eval()
+    with torch.no_grad():
+        return model(in_features)
 
 
 def run_transformer_block(
@@ -356,7 +399,10 @@ def run_softmax(in_features: Float[Tensor, " ..."], dim: int) -> Float[Tensor, "
         Float[Tensor, "..."]: Tensor of with the same shape as `in_features` with the output of
         softmax normalizing the specified `dim`.
     """
-    raise NotImplementedError
+    model = Softmax(dim=dim)
+    model.eval()
+    with torch.no_grad():
+        return model(in_features)
 
 
 def run_cross_entropy(
@@ -427,4 +473,84 @@ def run_train_bpe(
                 representing that <token1> was merged with <token2>.
                 Merges are ordered by order of creation.
     """
-    raise NotImplementedError
+    with open(input_path, "r", encoding="utf-8") as f:
+        text = f.read()
+
+    PAT = r"""’(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+
+    # split on special tokens
+    if special_tokens:
+        pattern = "|".join(re.escape(tok) for tok in special_tokens)
+        parts = re.split(f"({pattern})", text)
+    else:
+        parts = [text]
+
+    count_pretokens = Counter()
+
+    # count only normal pretokens
+    for part in parts:
+        if part in special_tokens:
+            continue
+        for match in re.finditer(PAT, part):
+            token = match.group(0)
+            count_pretokens[token] += 1
+
+    # current corpus representation: tuple[bytes, ...] -> count
+    corpus = Counter()
+    for token, count in count_pretokens.items():
+        seq = tuple(bytes([b]) for b in token.encode("utf-8"))
+        corpus[seq] += count
+
+    # initial vocab: all single bytes + special tokens
+    vocab = {}
+    cur_size = 0
+
+    for tok in special_tokens:
+        vocab[cur_size] = tok.encode("utf-8")
+        cur_size += 1
+
+    for b in range(256):
+        vocab[cur_size] = bytes([b])
+        cur_size += 1
+
+    merges = []
+
+    def adjacent_pairs(seq):
+        return zip(seq, seq[1:])
+
+    def merge_sequence(seq, pair):
+        merged = []
+        i = 0
+        new_sym = pair[0] + pair[1]
+        while i < len(seq):
+            if i < len(seq) - 1 and (seq[i], seq[i+1]) == pair:
+                merged.append(new_sym)
+                i += 2
+            else:
+                merged.append(seq[i])
+                i += 1
+        return tuple(merged)
+
+    while cur_size < vocab_size:
+        count_pairs = Counter()
+        for seq, count in corpus.items():
+            for pair in adjacent_pairs(seq):
+                count_pairs[pair] += count
+
+        if not count_pairs:
+            break
+
+        best_pair = max(count_pairs, key=count_pairs.get)
+        merges.append(best_pair)
+
+        new_token = best_pair[0] + best_pair[1]
+        vocab[cur_size] = new_token
+        cur_size += 1
+
+        new_corpus = Counter()
+        for seq, count in corpus.items():
+            new_seq = merge_sequence(seq, best_pair)
+            new_corpus[new_seq] += count
+        corpus = new_corpus
+
+    return vocab, merges
