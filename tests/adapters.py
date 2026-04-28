@@ -12,6 +12,8 @@ from collections import Counter
 
 from eecs148b_hw1 import Linear, Embedding, LayerNorm, FFN, SinusoidalPositionalEncoding, Softmax, MultiHeadSelfAttention
 
+EPS = 1e-5
+
 def run_linear(
     d_in: int,
     d_out: int,
@@ -276,8 +278,12 @@ def run_transformer_block(
         Float[Tensor, "batch sequence_length d_model"] Tensor with the output of
         running the Transformer block on the input features.
     """
-    raise NotImplementedError
-
+    x_layernormed = run_layernorm(d_model, eps=EPS, weight=weights['ln1.weight'], bias=weights['ln1.bias'],in_features=in_features)
+    x_attentioned = run_multihead_self_attention(d_model, num_heads, weights['attn.q_proj.weight'], weights['attn.k_proj.weight'], weights['attn.v_proj.weight'], weights['attn.output_proj.weight'], in_features=x_layernormed)
+    x = in_features + x_attentioned
+    x_res = run_layernorm(d_model, eps=EPS, weight=weights['ln2.weight'], bias=weights['ln2.bias'],in_features=x)
+    x_res = run_ffn(d_model, d_ff, weights['ffn.fc1.weight'], weights['ffn.fc2.weight'], x_res)
+    return x + x_res
 
 def run_transformer_lm(
     vocab_size: int,
@@ -360,7 +366,33 @@ def run_transformer_lm(
         Float[Tensor, "batch_size sequence_length vocab_size"]: Tensor with the predicted unnormalized
         next-word distribution for each token.
     """
-    raise NotImplementedError
+    embeddings = run_embedding(vocab_size, d_model, weights['token_embeddings.weight'], in_indices)
+    
+    # Generate position indices: 0 to seq_len-1 for each batch
+    seq_len = in_indices.shape[-1]
+    position_indices = torch.arange(seq_len, device=in_indices.device).unsqueeze(0).expand(in_indices.shape[0], -1)
+    pos_embeddings = run_sinusoidal_pe(d_model, context_length, position_indices)
+    embeddings += pos_embeddings
+    X = embeddings
+    for num_layer in range(0, num_layers):
+        layer_weights = dict()
+        layer_weights['attn.q_proj.weight'] = weights[f'layers.{num_layer}.attn.q_proj.weight']
+        layer_weights['attn.v_proj.weight'] = weights[f'layers.{num_layer}.attn.v_proj.weight']
+        layer_weights['attn.k_proj.weight'] = weights[f'layers.{num_layer}.attn.k_proj.weight']
+        layer_weights['attn.output_proj.weight'] = weights[f'layers.{num_layer}.attn.output_proj.weight']
+
+        layer_weights['ln1.weight'] = weights[f'layers.{num_layer}.ln1.weight']
+        layer_weights['ln2.weight'] = weights[f'layers.{num_layer}.ln2.weight']
+        layer_weights['ln1.bias'] = weights[f'layers.{num_layer}.ln1.bias']
+        layer_weights['ln2.bias'] = weights[f'layers.{num_layer}.ln2.bias']
+        layer_weights['ffn.fc1.weight'] = weights[f'layers.{num_layer}.ffn.fc1.weight']
+        layer_weights['ffn.fc2.weight'] = weights[f'layers.{num_layer}.ffn.fc2.weight']
+        
+        X = run_transformer_block(d_model, num_heads, d_ff, layer_weights, X)
+    
+    X = run_layernorm(d_model, EPS, weights['ln_final.weight'], weights['ln_final.bias'], X)
+
+    return X @ weights['lm_head.weight'].T 
 
 
 def run_get_batch(
